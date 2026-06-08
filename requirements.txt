@@ -24,9 +24,11 @@ weaviate-client>=4.5.0
 
 # Task 6 - BM25
 rank-bm25>=0.2.2
+pyvi>=0.1.1            # Word-segmentation tiếng Việt cho BM25 (tàng trữ, ma túy)
 
-# Task 7 - Reranking (choose one)
-# transformers>=4.40.0   # For local reranker models
+# Task 7 - Reranking
+# Cross-encoder local BAAI/bge-reranker-v2-m3 chạy qua sentence-transformers
+# (đã khai báo ở Task 4) -> không cần thêm package; chỉ cần tải weights lần đầu.
 
 # Task 8 - PageIndex
 pageindex>=0.1.0

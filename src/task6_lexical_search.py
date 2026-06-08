@@ -1,83 +1,116 @@
 """
 Task 6 — Lexical Search Module (BM25).
 
-Mặc định sử dụng BM25. Nếu dùng phương pháp khác (TF-IDF, Elasticsearch,
-Weaviate BM25 built-in), hãy giải thích cơ chế trong buổi demo → +5 bonus.
+==============================================================================
+THIẾT KẾ — tầng RECALL từ-vựng, MẢNH QUAN TRỌNG NHẤT cho corpus pháp luật.
+==============================================================================
+Query pháp lý thường chứa ĐỊNH DANH CHÍNH XÁC mà dense (Task 5) hay trượt:
+số Điều ("Điều 248"), mã văn bản ("57/2022/NĐ-CP"), tên hoá chất
+("Methamphetamine"). BM25 khớp đúng token nên bù chính xác điểm yếu đó.
 
-Cài đặt:
-    pip install rank-bm25
+Quyết định:
+  1. Corpus = data/index/chunks.jsonl (cùng tập với vector store ở Task 4)
+     -> dense & sparse xếp trên CÙNG không gian -> RRF ở Task 9 mới hợp lệ.
+  2. Tokenize tiếng Việt bằng pyvi (word-segmentation): "tàng trữ", "ma túy"
+     là TỪ GHÉP 2 âm tiết; split thô tách rời -> nhiễu IDF. Dùng CÙNG tokenizer
+     cho cả corpus lẫn query. Fallback split() nếu chưa cài pyvi.
+  3. GIỮ định danh: lowercase + bỏ markdown emphasis, NHƯNG không bỏ số/dấu
+     gạch chéo/dấu tiếng Việt -> "248", "57/2022/nđ-cp" còn nguyên làm token.
 
-BM25 hoạt động thế nào:
-    - Term Frequency (TF): từ xuất hiện nhiều trong document → điểm cao
-    - Inverse Document Frequency (IDF): từ hiếm → quan trọng hơn
-    - Document length normalization: document dài không bị ưu tiên quá mức
-    - Formula: score(q,d) = Σ IDF(qi) * (tf(qi,d) * (k1+1)) / (tf(qi,d) + k1*(1-b+b*|d|/avgdl))
-    - k1=1.5 (term saturation), b=0.75 (length normalization)
+Cơ chế BM25 (BM25Okapi, k1=1.5, b=0.75):
+    score(q,d) = Σ IDF(qi) · tf(qi,d)·(k1+1) / (tf(qi,d) + k1·(1−b + b·|d|/avgdl))
+  - TF: từ xuất hiện nhiều trong doc -> điểm cao (bão hoà bởi k1).
+  - IDF: từ hiếm trong corpus -> trọng số lớn hơn.
+  - |d|/avgdl: chuẩn hoá độ dài, doc dài không bị ưu tiên quá mức (điều chỉnh b).
 """
 
-from pathlib import Path
+import re
 
-# TODO: Load corpus từ data/standardized/ hoặc từ vector store
-CORPUS: list[dict] = []  # List of {'content': str, 'metadata': dict}
+from .task4_chunking_indexing import load_chunks
+
+# Index dựng 1 lần rồi cache (lazy) — tránh tokenize lại corpus mỗi truy vấn.
+_BM25 = None
+_CORPUS: list[dict] = []
+
+# Token hợp lệ: chữ (có dấu tiếng Việt), chữ số, và '/.' để giữ mã văn bản như
+# 57/2022/nđ-cp. \w trong Python (re.UNICODE) đã bao gồm ký tự có dấu.
+_TOKEN_RE = re.compile(r"[\w/]+", re.UNICODE)
+
+
+def _tokenize(text: str) -> list[str]:
+    """Chuẩn hoá + tách token tiếng Việt (pyvi word-segmentation, fallback split)."""
+    text = text.lower().replace("_", " ")          # bỏ '_' của markdown emphasis
+    try:
+        from pyvi import ViTokenizer
+        # ViTokenizer nối các âm tiết cùng từ bằng '_'; ta tách lại thành token từ.
+        text = ViTokenizer.tokenize(text)
+        tokens = []
+        for w in text.split():
+            tokens.extend(_TOKEN_RE.findall(w.replace("_", "")))
+        return [t for t in tokens if t]
+    except Exception:
+        # Fallback: tách theo regex giữ định danh (đủ tốt nếu chưa cài pyvi).
+        return _TOKEN_RE.findall(text)
 
 
 def build_bm25_index(corpus: list[dict]):
-    """
-    Xây dựng BM25 index từ corpus.
+    """Dựng BM25 index từ corpus [{'content', 'metadata'}].
 
-    Args:
-        corpus: List of {'content': str, 'metadata': dict}
+    Returns:
+        (bm25, corpus) — giữ corpus song song để map ngược chỉ số -> chunk.
     """
-    # TODO: Implement BM25 index
-    #
-    # from rank_bm25 import BM25Okapi
-    #
-    # # Tokenize - cho tiếng Việt nên dùng underthesea hoặc đơn giản split()
-    # tokenized_corpus = [doc["content"].lower().split() for doc in corpus]
-    # bm25 = BM25Okapi(tokenized_corpus)
-    # return bm25
-    raise NotImplementedError("Implement build_bm25_index")
+    from rank_bm25 import BM25Okapi
+
+    tokenized = [_tokenize(doc["content"]) for doc in corpus]
+    bm25 = BM25Okapi(tokenized)   # k1=1.5, b=0.75 mặc định
+    return bm25, corpus
+
+
+def _get_index():
+    """Lazy-load: đọc chunks.jsonl (source-of-truth Task 4) và dựng index 1 lần."""
+    global _BM25, _CORPUS
+    if _BM25 is None:
+        _CORPUS = load_chunks()
+        _BM25, _ = build_bm25_index(_CORPUS)
+    return _BM25, _CORPUS
 
 
 def lexical_search(query: str, top_k: int = 10) -> list[dict]:
-    """
-    Tìm kiếm từ khóa sử dụng BM25.
+    """Tìm kiếm từ khoá bằng BM25.
 
     Args:
-        query: Câu truy vấn
-        top_k: Số lượng kết quả tối đa
+        query: Câu truy vấn.
+        top_k: Số kết quả tối đa.
 
     Returns:
-        List of {
-            'content': str,
-            'score': float,      # BM25 score
-            'metadata': dict
-        }
-        Sorted by score descending.
+        List of {'content', 'score', 'metadata'} sorted by score giảm dần,
+        chỉ giữ chunk có score > 0 (có khớp token).
     """
-    # TODO: Implement lexical search
-    #
-    # tokenized_query = query.lower().split()
-    # scores = bm25.get_scores(tokenized_query)
-    #
-    # # Get top_k indices
-    # import numpy as np
-    # top_indices = np.argsort(scores)[::-1][:top_k]
-    #
-    # results = []
-    # for idx in top_indices:
-    #     if scores[idx] > 0:
-    #         results.append({
-    #             "content": CORPUS[idx]["content"],
-    #             "score": float(scores[idx]),
-    #             "metadata": CORPUS[idx]["metadata"]
-    #         })
-    # return results
-    raise NotImplementedError("Implement lexical_search")
+    import numpy as np
+
+    bm25, corpus = _get_index()
+    scores = bm25.get_scores(_tokenize(query))
+
+    top_idx = np.argsort(scores)[::-1][:top_k]
+    results = []
+    for idx in top_idx:
+        if scores[idx] <= 0:
+            continue
+        results.append(
+            {
+                "content": corpus[idx]["content"],
+                "score": float(scores[idx]),
+                "metadata": corpus[idx]["metadata"],
+            }
+        )
+    return results
 
 
 if __name__ == "__main__":
-    # Test
-    results = lexical_search("Điều 248 tàng trữ trái phép chất ma tuý", top_k=5)
-    for r in results:
-        print(f"[{r['score']:.3f}] {r['content'][:100]}...")
+    for q in ["Điều 248 tàng trữ trái phép chất ma tuý",
+              "57/2022/NĐ-CP"]:
+        print(f"\nQuery: {q}\n" + "-" * 60)
+        for r in lexical_search(q, top_k=5):
+            m = r["metadata"]
+            tag = f"Điều {m.get('dieu')}" if m.get("dieu") else m.get("source", "")
+            print(f"[{r['score']:.2f}] ({tag}) {r['content'][:90]}...")
