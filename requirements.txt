@@ -6,7 +6,14 @@ requests>=2.31.0
 crawl4ai>=0.3.0
 
 # Task 3 - Document conversion
-markitdown>=0.1.0
+markitdown[pdf,docx]>=0.1.0
+# Nguồn legal dạng .doc cũ (OLE2) -> convert sang .docx bằng LibreOffice headless
+# (binary `soffice`) trước khi đưa vào MarkItDown. Cài: libreoffice-still.
+# OCR fallback giữ lại cho trường hợp PDF scan không có text layer.
+# Cần tesseract binary + vie.traineddata (tải sẵn vào ./tessdata/).
+pytesseract>=0.3.13
+pdf2image>=1.17.0
+pillow>=10.0.0
 
 # Task 4 - Chunking & Indexing
 langchain-text-splitters>=0.2.0
