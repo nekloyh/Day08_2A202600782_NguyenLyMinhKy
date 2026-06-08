@@ -40,27 +40,31 @@ def semantic_search(query: str, top_k: int = 10) -> list[dict]:
     """
     from weaviate.classes.query import MetadataQuery
 
-    # Embed query bằng đúng model đã index (normalize -> cùng không gian cosine).
-    vec = _get_embedder().encode([query], normalize_embeddings=True)[0].tolist()
-
-    client = connect_weaviate()
     try:
-        col = client.collections.get(COLLECTION_NAME)
-        res = col.query.near_vector(
-            near_vector=vec,
-            limit=top_k,
-            return_metadata=MetadataQuery(distance=True),
-        )
-        results = [
-            {
-                "content": o.properties["content"],
-                "score": 1.0 - o.metadata.distance,   # distance -> similarity
-                "metadata": {k: o.properties.get(k) for k in _META_FIELDS},
-            }
-            for o in res.objects
-        ]
-    finally:
-        client.close()
+        # Embed query bằng đúng model đã index (normalize -> cùng không gian cosine).
+        vec = _get_embedder().encode([query], normalize_embeddings=True)[0].tolist()
+
+        client = connect_weaviate()
+        try:
+            col = client.collections.get(COLLECTION_NAME)
+            res = col.query.near_vector(
+                near_vector=vec,
+                limit=top_k,
+                return_metadata=MetadataQuery(distance=True),
+            )
+            results = [
+                {
+                    "content": o.properties["content"],
+                    "score": 1.0 - o.metadata.distance,   # distance -> similarity
+                    "metadata": {k: o.properties.get(k) for k in _META_FIELDS},
+                }
+                for o in res.objects
+            ]
+        finally:
+            client.close()
+    except Exception as exc:
+        print(f"  ⚠ Semantic search unavailable: {exc}")
+        return []
 
     # near_vector đã trả theo distance tăng dần; ép sort để chắc chắn giảm dần.
     results.sort(key=lambda r: r["score"], reverse=True)

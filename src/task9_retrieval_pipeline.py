@@ -1,16 +1,25 @@
 """
 Task 9 — Retrieval Pipeline Hoàn Chỉnh.
 
-Kết hợp semantic search + lexical search + reranking + PageIndex fallback
-thành một pipeline thống nhất.
+==============================================================================
+THIẾT KẾ — ráp pipeline 2 tầng (recall -> precision) + fallback vectorless.
+==============================================================================
+   Query
+     ├→ semantic_search (dense, Task 5) ─┐
+     ├→ lexical_search  (BM25,  Task 6) ─┤→ RRF fuse (Task 7) ─→ cross-encoder
+     │                                                              rerank (Task 7)
+     │                                                                   │
+     └→ nếu best_score < threshold ─→ pageindex_search (vectorless, Task 8)
 
-Logic:
-    1. Chạy semantic_search + lexical_search song song
-    2. Merge kết quả (RRF hoặc weighted fusion)
-    3. Rerank
-    4. Nếu top result score < threshold → fallback sang PageIndex
-    5. Return top_k results
+Vì sao RRF để hợp nhất dense & sparse: hai bên có THANG ĐIỂM khác nhau (cosine
+∈[0,1] vs BM25 ∈[0,~30]) -> không cộng trực tiếp được; RRF gộp theo THỨ HẠNG
+nên công bằng. Sau đó cross-encoder đọc lại cặp (query, chunk) để xếp precision.
+
+Chuẩn hoá điểm: cross-encoder trả LOGIT (không bị chặn) -> ta bọc sigmoid về
+[0,1] để ngưỡng fallback (score_threshold) có ý nghĩa nhất quán.
 """
+
+import math
 
 from .task5_semantic_search import semantic_search
 from .task6_lexical_search import lexical_search
@@ -21,10 +30,27 @@ from .task8_pageindex_vectorless import pageindex_search
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-
-SCORE_THRESHOLD = 0.3   # Nếu best score < threshold → fallback PageIndex
+SCORE_THRESHOLD = 0.3            # best score (đã sigmoid) < ngưỡng -> fallback
 DEFAULT_TOP_K = 5
-RERANK_METHOD = "cross_encoder"  # "cross_encoder" | "mmr" | "rrf"
+RECALL_MULTIPLIER = 4            # lấy rộng ở tầng recall trước khi rerank
+RRF_K = 60
+
+
+def _sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def _safe_search(name: str, fn, query: str, top_k: int) -> list[dict]:
+    try:
+        return fn(query, top_k=top_k)
+    except Exception as exc:
+        print(f"  ⚠ {name} search failed: {exc}")
+        return []
+
+
+def _normalize_rrf_score(score: float) -> float:
+    # Max with two rankers at rank 1: 2/(k+1). Keep threshold comparable.
+    return min(1.0, score / (2.0 / (RRF_K + 1)))
 
 
 def retrieve(
@@ -33,72 +59,61 @@ def retrieve(
     score_threshold: float = SCORE_THRESHOLD,
     use_reranking: bool = True,
 ) -> list[dict]:
-    """
-    Retrieval pipeline hoàn chỉnh với fallback logic.
-
-    Pipeline:
-        Query
-          ├→ Semantic Search → results_dense
-          ├→ Lexical Search  → results_sparse
-          │
-          ├→ Merge (RRF) → merged_results
-          ├→ Rerank → reranked_results
-          │
-          └→ If best_score < threshold:
-                └→ PageIndex Vectorless → fallback_results
-
-    Args:
-        query: Câu truy vấn
-        top_k: Số lượng kết quả cuối cùng
-        score_threshold: Ngưỡng điểm tối thiểu cho hybrid results
-        use_reranking: Có áp dụng reranking hay không
+    """Retrieval pipeline hoàn chỉnh với fallback vectorless.
 
     Returns:
-        List of {
-            'content': str,
-            'score': float,
-            'metadata': dict,
-            'source': str  # 'hybrid' hoặc 'pageindex'
-        }
+        List of {'content', 'score', 'metadata', 'source': 'hybrid'|'pageindex'}.
     """
-    # TODO: Implement full retrieval pipeline
-    #
-    # Step 1: Song song chạy semantic + lexical
-    # dense_results = semantic_search(query, top_k=top_k * 2)
-    # sparse_results = lexical_search(query, top_k=top_k * 2)
-    #
-    # Step 2: Merge bằng RRF
-    # merged = rerank_rrf([dense_results, sparse_results], top_k=top_k * 2)
-    # for item in merged:
-    #     item["source"] = "hybrid"
-    #
-    # Step 3: Rerank
-    # if use_reranking and merged:
-    #     final_results = rerank(query, merged, top_k=top_k, method=RERANK_METHOD)
-    # else:
-    #     final_results = merged[:top_k]
-    #
-    # Step 4: Check threshold → fallback
-    # if not final_results or final_results[0]["score"] < score_threshold:
-    #     print(f"  ⚠ Hybrid score ({final_results[0]['score']:.3f} if final_results else 0}) "
-    #           f"< threshold ({score_threshold}). Fallback → PageIndex")
-    #     fallback = pageindex_search(query, top_k=top_k)
-    #     return fallback
-    #
-    # return final_results[:top_k]
-    raise NotImplementedError("Implement retrieve")
+    recall_k = max(top_k * RECALL_MULTIPLIER, top_k)
+
+    # --- Tầng recall: dense + sparse độc lập để một bên lỗi không làm sập pipeline ---
+    dense = _safe_search("semantic", semantic_search, query, recall_k)
+    sparse = _safe_search("lexical", lexical_search, query, recall_k)
+
+    # --- Hợp nhất theo thứ hạng (RRF) ---
+    ranked_lists = [r for r in (dense, sparse) if r]
+    fused = rerank_rrf(ranked_lists, top_k=recall_k, k=RRF_K) if ranked_lists else []
+
+    # --- Tầng precision: cross-encoder rerank + chuẩn hoá sigmoid ---
+    if use_reranking and fused:
+        try:
+            ranked = rerank(query, fused, top_k=top_k, method="cross_encoder")
+            for r in ranked:
+                r["score"] = _sigmoid(r["score"])
+                r["source"] = "hybrid"
+        except Exception as exc:
+            print(f"  ⚠ Rerank failed: {exc}; using normalized RRF.")
+            ranked = fused[:top_k]
+            for r in ranked:
+                r["score"] = _normalize_rrf_score(r["score"])
+                r["source"] = "hybrid"
+    else:
+        ranked = fused[:top_k]
+        for r in ranked:
+            r["score"] = _normalize_rrf_score(r["score"])
+            r["source"] = "hybrid"
+
+    best = ranked[0]["score"] if ranked else 0.0
+
+    # --- Fallback: hybrid yếu -> vectorless PageIndex theo cấu trúc cây ---
+    if not ranked or best < score_threshold:
+        fallback = pageindex_search(query, top_k=top_k)
+        if fallback:
+            return fallback[:top_k]
+        return []
+
+    return ranked[:top_k]
 
 
 if __name__ == "__main__":
     test_queries = [
         "Hình phạt cho tội tàng trữ trái phép chất ma tuý",
-        "Nghệ sĩ nào bị bắt vì sử dụng ma tuý năm 2024",
+        "Nghệ sĩ nào bị bắt vì sử dụng ma tuý",
         "Luật phòng chống ma tuý 2021 quy định gì về cai nghiện",
     ]
-
     for q in test_queries:
-        print(f"\nQuery: {q}")
-        print("-" * 60)
-        results = retrieve(q, top_k=3)
-        for i, r in enumerate(results, 1):
-            print(f"  {i}. [{r['score']:.3f}] [{r['source']}] {r['content'][:80]}...")
+        print(f"\nQuery: {q}\n" + "-" * 60)
+        for i, r in enumerate(retrieve(q, top_k=3), 1):
+            m = r.get("metadata", {})
+            tag = f"Điều {m.get('dieu')}" if m.get("dieu") else m.get("source", "")
+            print(f"  {i}. [{r['score']:.3f}] [{r['source']}] ({tag}) {r['content'][:70]}...")

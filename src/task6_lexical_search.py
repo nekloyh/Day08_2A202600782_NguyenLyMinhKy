@@ -35,6 +35,12 @@ _CORPUS: list[dict] = []
 # Token hợp lệ: chữ (có dấu tiếng Việt), chữ số, và '/.' để giữ mã văn bản như
 # 57/2022/nđ-cp. \w trong Python (re.UNICODE) đã bao gồm ký tự có dấu.
 _TOKEN_RE = re.compile(r"[\w/]+", re.UNICODE)
+_DIEU_RE = re.compile(r"điều\s+(\d+)", re.IGNORECASE)
+_DOCCODE_RE = re.compile(r"\d+\s*/\s*\d+\s*/\s*[\w\-]+", re.IGNORECASE)
+
+
+def _normalize_code(text: str) -> str:
+    return re.sub(r"[^0-9a-zA-ZàáâãèéêìíòóôõùúýđĐ/-]+", "", text).lower()
 
 
 def _tokenize(text: str) -> list[str]:
@@ -90,16 +96,48 @@ def lexical_search(query: str, top_k: int = 10) -> list[dict]:
 
     bm25, corpus = _get_index()
     scores = bm25.get_scores(_tokenize(query))
+    boosted = scores.copy()
 
-    top_idx = np.argsort(scores)[::-1][:top_k]
+    query_lower = query.lower()
+    query_dieu = {int(m.group(1)) for m in _DIEU_RE.finditer(query)}
+    query_codes = {_normalize_code(c) for c in _DOCCODE_RE.findall(query)}
+    phrase_boosts = [
+        phrase for phrase in (
+            "tàng trữ trái phép",
+            "vận chuyển trái phép",
+            "mua bán trái phép",
+            "tổ chức sử dụng",
+            "cai nghiện bắt buộc",
+            "cai nghiện tự nguyện",
+        )
+        if phrase in query_lower
+    ]
+
+    for idx, doc in enumerate(corpus):
+        meta = doc.get("metadata", {})
+        title_text = (meta.get("doc_title", "") + " " + meta.get("dieu_title", "")).lower()
+        text = (doc.get("content", "") + " " + meta.get("source", "") + " " +
+                title_text).lower()
+        if query_dieu and meta.get("dieu") in query_dieu:
+            boosted[idx] += 20.0
+        for code in query_codes:
+            if code and code in _normalize_code(text):
+                boosted[idx] += 15.0
+        for phrase in phrase_boosts:
+            if phrase in title_text:
+                boosted[idx] += 12.0
+            if phrase in text:
+                boosted[idx] += 5.0
+
+    top_idx = np.argsort(boosted)[::-1][:top_k]
     results = []
     for idx in top_idx:
-        if scores[idx] <= 0:
+        if boosted[idx] <= 0:
             continue
         results.append(
             {
                 "content": corpus[idx]["content"],
-                "score": float(scores[idx]),
+                "score": float(boosted[idx]),
                 "metadata": corpus[idx]["metadata"],
             }
         )

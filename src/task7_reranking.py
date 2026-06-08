@@ -19,6 +19,8 @@ THIẾT KẾ — tầng PRECISION của pipeline 2 tầng. Dùng đủ 3 kỹ th
 import math
 from typing import Optional
 
+from .model_runtime import load_with_cpu_fallback
+
 # Cross-encoder nạp 1 lần rồi cache (lazy) — model nặng, tránh nạp lại mỗi query.
 _RERANKER = None
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
@@ -30,11 +32,12 @@ RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 def _get_reranker():
     global _RERANKER
     if _RERANKER is None:
-        import torch
         from sentence_transformers import CrossEncoder
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        _RERANKER = CrossEncoder(RERANKER_MODEL, device=device)
+        _RERANKER = load_with_cpu_fallback(
+            lambda device: CrossEncoder(RERANKER_MODEL, device=device),
+            "RERANKER_DEVICE",
+        )
     return _RERANKER
 
 

@@ -46,6 +46,8 @@ import json
 import re
 from pathlib import Path
 
+from .model_runtime import load_with_cpu_fallback
+
 PROJECT_DIR = Path(__file__).parent.parent
 STANDARDIZED_DIR = PROJECT_DIR / "data" / "standardized"
 INDEX_DIR = PROJECT_DIR / "data" / "index"
@@ -243,11 +245,12 @@ _EMBEDDER = None
 def _get_embedder():
     global _EMBEDDER
     if _EMBEDDER is None:
-        import torch
         from sentence_transformers import SentenceTransformer
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        _EMBEDDER = SentenceTransformer(EMBEDDING_MODEL, device=device)
+        _EMBEDDER = load_with_cpu_fallback(
+            lambda device: SentenceTransformer(EMBEDDING_MODEL, device=device),
+            "EMBEDDING_DEVICE",
+        )
     return _EMBEDDER
 
 
